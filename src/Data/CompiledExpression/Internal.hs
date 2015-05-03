@@ -1,6 +1,7 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE LambdaCase #-}
@@ -9,6 +10,7 @@
 module Data.CompiledExpression.Internal where
 
 import Control.Concurrent
+import Control.Concurrent.STM
 import Control.Exception
 import Control.Lens hiding ( Context )
 import Control.Monad ( void, forever, unless, when )
@@ -16,11 +18,10 @@ import Control.Monad.IO.Class
 import Control.Monad.Primitive ( touch )
 import Control.Monad.Trans.Except
 import Control.Monad.Trans.State.Strict
-import Data.IORef
 import Data.Bits
 import Data.Data
 import Data.Foldable
-import Data.Traversable
+import Data.Monoid
 import Data.Hashable
 import GHC.Generics hiding ( moduleName )
 import qualified Data.HashMap.Strict as HM
@@ -32,6 +33,7 @@ import Foreign.Ptr
 import Foreign.Storable
 import Foreign.C.Types
 import LLVM.General as G
+import LLVM.General.Threading as G
 import LLVM.General.AST as LLVM hiding ( mask, type' )
 import LLVM.General.AST.AddrSpace as LLVM
 import LLVM.General.AST.Linkage as LLVM
@@ -147,84 +149,90 @@ combine :: Either a a -> a
 combine (Left x) = x
 combine (Right x) = x
 
-globalJit :: MVar (Maybe (JIT, Context))
-globalJit = unsafePerformIO $ newMVar Nothing
+globalJit :: TMVar (Maybe (JIT, Context))
+globalJit = unsafePerformIO $ newTMVarIO Nothing
 {-# NOINLINE globalJit #-}
 
-jitThread :: IO ()
-jitThread = mask $ \restore -> do
-    result <- takeMVar globalJit
-    case result of
-        Just _ -> putMVar globalJit result >> return ()
-        Nothing -> do
-            withContext $ \ctx -> withJIT ctx 0 $ \jit -> do
-                putMVar globalJit $ Just (jit, ctx)
-                restore $ forever $ threadDelay 100000000 >> touch jit >> touch ctx
+jitCreated :: MVar Bool
+jitCreated = unsafePerformIO $ newMVar False
+{-# NOINLINE jitCreated #-}
+
+jitThread :: MVar () -> IO ()
+jitThread ready_mvar = mask $ \restore -> do
+    setMultithreaded True
+    withContext $ \ctx -> withJIT ctx 0 $ \jit -> do
+        i_own_context <- atomically $ do
+            result <- readTMVar globalJit
+            case result of
+                Nothing -> do
+                    void $ takeTMVar globalJit
+                    putTMVar globalJit (Just (jit, ctx)) >> return True
+                Just _ -> return False
+        when i_own_context $ do
+            putMVar ready_mvar ()
+            restore $ forever $ threadDelay 100000000 >> touch jit >> touch ctx
 
 ensureJitExists :: IO ()
-ensureJitExists = withContextJit $ \_ _ -> return ()
+ensureJitExists = mask_ $ do
+    x <- takeMVar jitCreated
+    if x
+      then putMVar jitCreated True
+      else do mvar <- newEmptyMVar
+              void $ forkIO $ jitThread mvar
+              takeMVar mvar
+              putMVar jitCreated True
 
-takeJit :: MonadIO m => m (JIT, Context)
-takeJit = liftIO $ do
+withJitAccess :: (JIT -> Context -> IO () -> IO () -> IO a) -> IO a
+withJitAccess action = do
     ensureJitExists
-    Just (jit, ctx) <- takeMVar globalJit
-    return (jit, ctx)
+    mask $ \restore -> do
+        is_it_taken_tvar <- newTVarIO True
+        Just (jit, ctx) <- atomically $
+            takeTMVar globalJit
+        let maybeRestore = atomically $ do
+                               is_it_taken <- readTVar is_it_taken_tvar
+                               when is_it_taken $ do
+                                   writeTVar is_it_taken_tvar False
+                                   putTMVar globalJit (Just (jit, ctx))
 
-restoreJit :: MonadIO m => JIT -> Context -> m ()
-restoreJit jit ctx = liftIO $
-    putMVar globalJit (Just (jit, ctx))
+            maybeTake = atomically $ do
+                            is_it_taken <- readTVar is_it_taken_tvar
+                            unless is_it_taken $ do
+                                writeTVar is_it_taken_tvar True
+                                void $ takeTMVar globalJit
 
-withContextJit :: (JIT -> Context -> IO a) -> IO a
-withContextJit action = do
-    readMVar globalJit >>= \case
-        Nothing -> forkIO jitThread >> yield >> withContextJit action
-        Just _ -> withMVar globalJit $ \(Just (jit, ctx)) ->
-            action jit ctx
+        finally (restore $ action jit ctx maybeRestore maybeTake) maybeRestore
 
 llvmCode :: LLVM.Module -> IO (Ptr CDouble -> Ptr CDouble -> IO ())
 llvmCode mod = do
     result_mvar <- newEmptyMVar
-    void $ forkIO $ do_it result_mvar
+    void $ forkIO $
+        mask $ \restore -> withJitAccess $ \jit ctx restoreJit takeJit ->
+            do_it restore result_mvar jit ctx restoreJit takeJit
     takeMVar result_mvar
   where
-    do_it result_mvar = mask $ \restore -> do
-        ensureJitExists
-        (jit, ctx) <- takeJit
-        taken_ref <- newIORef True
-        result <- flip finally (do
-                x <- readIORef taken_ref
-                when x $ restoreJit jit ctx) $
-                runExceptT $ withModuleFromAST ctx mod $ \gmod -> do
-            dead_mvar <- newEmptyMVar
-            flip finally (takeMVar dead_mvar >> takeMVar globalJit >> atomicModifyIORef' taken_ref (\_ -> ( True, () )) ) $ do
-                mvar <- newEmptyMVar
-                job_mvar <- newEmptyMVar
-                tid <- restore $ forkIO $ flip finally (putMVar dead_mvar ()) $ flip onException (putMVar mvar Nothing) $ withModuleInEngine jit gmod $ \execmodule -> do
-                        restoreJit jit ctx
-                        atomicModifyIORef' taken_ref $ \_ -> ( False, () )
-                        flip finally (takeMVar globalJit >> atomicModifyIORef' taken_ref (\_ -> ( True, () ))) $ do
-                            funptr <- getFunction execmodule (Name "synthvargraph_computation")
-                            case funptr of
-                                Nothing -> error "llvmCode: cannot execute JIT."
-                                Just actual_ptr -> do
-                                    let addr = mkCalling (castFunPtr actual_ptr)
-                                    addr nullPtr nullPtr
+    do_it restore result_mvar jit ctx restoreJit takeJit = do
+        result <- runExceptT $ withModuleFromAST ctx mod $ \gmod -> do
+            withModuleInEngine jit gmod $ \execmodule -> do
+                () <- restoreJit
+                flip finally takeJit $ do
+                    funptr <- getFunction execmodule (Name "synthvargraph_computation")
+                    case funptr of
+                        Nothing -> error "llvmCode: cannot execute JIT."
+                        Just actual_ptr -> do
+                            let addr = mkCalling (castFunPtr actual_ptr)
+                            addr nullPtr nullPtr
 
-                                    putMVar mvar (Just addr)
-                                    forever $ threadDelay 100000000
-                maybe_fun <- takeMVar mvar
-                case maybe_fun of
-                    Nothing -> error "llvmCode: cannot compile code."
-                    Just fun -> do
-                        my_tid <- myThreadId
-                        void $ mkWeakMVar job_mvar $ do
-                            killThread tid
-                            killThread my_tid
-                        putMVar result_mvar $ \ptr1 ptr2 -> do
-                            fun ptr1 ptr2
-                            touch job_mvar
-                        restore $ forever $ threadDelay 100000000
+                            my_tid <- myThreadId
+                            finalizer_mvar <- newEmptyMVar
+                            void $ mkWeakMVar finalizer_mvar $
+                                killThread my_tid
 
+                            putMVar result_mvar $ \ptr1 ptr2 -> do
+                                addr ptr1 ptr2
+                                touch finalizer_mvar
+
+                            restore $ forever $ threadDelay 100000000
         case result of
             Left err -> error err
             Right ok -> return ok
@@ -237,17 +245,29 @@ llvmCode mod = do
 -- Behind the scenes, the expression is transformed to LLVM IR, compiled to
 -- machine code and then returned in a form callable from Haskell.
 --
+-- There is a lot of overhead in calling the returned function. If your Haskell
+-- function is a simple one that GHC can already optimize well then the
+-- returned function has a high chance of being slower, perhaps significanty so.
+-- However, if your function is a complex one that GHC either has trouble
+-- optimizing (e.g. you are using complex data structures or functions from
+-- many libraries) or cannot optimize, then `compileExpression` might be able
+-- to help you.
+--
 -- Depending on the size of your computation, this function can take a long
 -- time to return.
 --
--- The first argument to this function is the Haskell function to be optimized.
+-- The first two arguments traverse the containers (you might want to check the
+-- \'lens\' package). If your containers implement `Traversable`, then you can
+-- just use `traverse` here directly.
 --
--- The second argument gives the structure of the container that
+-- The third argument to this function is the Haskell function to be optimized.
+--
+-- The fourth argument gives the structure of the container that
 -- `compileExpression` will assume is used for any future computation. For
 -- example, if you call `compileExpression` with a list of 5 elements:
 --
 -- @
---     let optimized = compileExpression (\lst -> [sum lst]) [(), (), (), (), ()]
+--     let optimized = compileExpression traverse traverse (\lst -> [sum lst]) [(), (), (), (), ()]
 -- @
 --
 -- Then subsequently, the returned function \'optimized\' will only work with
@@ -260,30 +280,37 @@ llvmCode mod = do
 --
 -- The structure is checked for the number of elements but not further than
 -- that.
-compileExpression :: (Traversable f, Traversable f2)
-                  => (forall a. Floating a => f a -> f2 a)
+compileExpression :: (forall c d. Traversal (f c) (f d) c d)
+                  -> (forall c d. Traversal (f2 c) (f2 d) c d)
+                  -> (forall a. Floating a => f a -> f2 a)
                   -> f b   -- ^ Structure of the container. The values are not used.
                   -> (f Double -> f2 Double)
-compileExpression modifier source = unsafePerformIO $ do
+compileExpression traverse1 traverse2 modifier source = unsafePerformIO $ do
     let walked = modifier synthesized
-    (outputs, graphized) <- graphifyStructure walked
-    let mod = llvmfy (toList outputs, graphized)
-        num_outputs = length outputs
+    (outputs, graphized) <- graphifyStructure traverse2 walked
+
+    let listed_outputs = toListOf traverse2 outputs
+        mod = llvmfy (listed_outputs, graphized)
+        num_outputs = length listed_outputs
         stumped_output = stump walked
+
     raw_function <- llvmCode mod
+
     return $ \inp -> unsafePerformIO $ do
-        let inp_len = length inp
-            inp_list = fmap CDouble $ toList inp
+        let inp_len = lengthOf traverse1 inp
         unless (inp_len == len) $
-            error "Input length is unexpected."
-        withArray inp_list $ \(arr :: Ptr CDouble) -> do
+            error $ "<expression compiled by compileExpression>: Input length is unexpected. Expecting length " <> show len <> ", got " <> show inp_len <> "."
+
+        allocaArray inp_len $ \inp_arr -> do
+            iforOf_ (indexing traverse1) inp $ \index value ->
+                pokeElemOff inp_arr index (CDouble value)
             allocaArray num_outputs $ \(output_arr :: Ptr CDouble) -> do
-                raw_function arr output_arr
+                raw_function inp_arr output_arr
                 unwrap stumped_output (castPtr output_arr)
   where
-    stump = fmap (const ())
+    stump = over traverse2 (const ())
 
-    unwrap structure ptr = evalStateT (traverse unwrapItem structure) 0
+    unwrap structure ptr = evalStateT (traverseOf traverse2 unwrapItem structure) 0
       where
         unwrapItem _ = do
             idx <- get
@@ -291,7 +318,7 @@ compileExpression modifier source = unsafePerformIO $ do
             result <- liftIO $ peekElemOff ptr idx
             return result
 
-    (synthesized, len) = runState (traverse walk source) 0
+    (synthesized, len) = runState (traverseOf traverse1 walk source) 0
       where
         walk _ = do
             idx <- get
@@ -300,11 +327,11 @@ compileExpression modifier source = unsafePerformIO $ do
 {-# INLINE compileExpression #-}
 
 -- | Given a traversable container of `SynthVar`s, build a `SynthVarGraph`.
-graphifyStructure :: Traversable f
-                  => f SynthVar
+graphifyStructure :: (forall a b. Traversal (f a) (f b) a b)
+                  -> f SynthVar
                   -> IO (f Int, IM.IntMap SynthVarGraph) -- ^ Returns the indices of output variables and the variable graph.
-graphifyStructure structure = fmap (over _2 _graph) $
-    flip runStateT initialSynthVarBuilder $ for structure $ \synth_var -> do
+graphifyStructure traversal1 structure = fmap (over _2 _graph) $
+    flip runStateT initialSynthVarBuilder $ forOf traversal1 structure $ \synth_var -> do
         old_svb <- get
         (target_int, new_svb) <- liftIO $ graphify synth_var old_svb
         put new_svb
