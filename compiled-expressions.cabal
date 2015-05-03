@@ -19,6 +19,8 @@ description:
     However, when it works, the performance boost can be astounding. In my
     simulations of Hopfield neural networks, the compiled expression executes
     around 30x faster. This package contains some cabal benchmarks.
+    .
+    See the README.md file for an example.
 license:             MIT
 license-file:        LICENSE
 author:              Mikko Juola

@@ -19,6 +19,26 @@ However, when it works, the performance boost can be astounding. In my
 simulations of Hopfield neural networks, the compiled expression executes
 around 30x faster. This package contains some cabal benchmarks.
 
+Example usage
+-------------
+
+    -- This function compiles a function that computes the sum
+    -- of 10 values at run-time.
+
+    import Data.CompiledExpression
+
+    -- describes the structure of the container we use
+    list_structure :: [()]
+    list_structure = replicate 10 ()
+
+    -- make a compiled function
+    compiled :: [Double] -> Double
+    compiled = compileExpression1 traverse sum list_structure
+
+    -- now 'compiled' works like 'sum', as long as lists of size 10 are used
+    compiled [1,2,3,4,5,6,7,8,9,10] --> 55
+    sum [1,2,3,4,5,6,7,8,9,10]      --> 55
+
 How to report bugs, ask questions
 ---------------------------------
 
