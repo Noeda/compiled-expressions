@@ -25,12 +25,20 @@ sinProgram initial = do
 runSinProgram :: Floating a => a -> a
 runSinProgram val = execState (sinProgram val) 0
 
+reductingProgram :: Floating a => [a] -> [a]
+reductingProgram = fmap (const 5)
+
+inputMapProgram :: Floating a => [a] -> [a]
+inputMapProgram = fmap (**2)
+
 main :: IO ()
 main =
    let lst100sum = compileExpression1 traverse sum (lst100 :: [Double])
        lst1000sum = compileExpression1 traverse sum (lst1000 :: [Double])
        lst10000sum = compileExpression1 traverse sum (lst10000 :: [Double])
        runSinProgramCompiled = compileExpression3 runSinProgram
+       reductingCompiled = compileExpression traverse traverse reductingProgram (replicate 10 ())
+       inputMapCompiled = compileExpression traverse traverse inputMapProgram (replicate 10 ())
     in defaultMain [
          bench "sinProgram (vanilla)" $ whnf runSinProgram (123 :: Double)
        , bench "sinProgram (compiled)" $ whnf runSinProgramCompiled 123
@@ -42,5 +50,7 @@ main =
          , bench "sum of 10000 doubles (vanilla)" $ whnf sum (lst10000 :: [Double])
          , bench "sum of 10000 doubles (compiled)" $ whnf lst10000sum lst10000
          ]
+       , bench "reducting program" $ whnf reductingCompiled [1,2,3,4,5,6,7,8,9,10]
+       , bench "input mapping program" $ whnf inputMapCompiled [11,22,33,44,55]
        ]
 
