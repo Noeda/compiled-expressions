@@ -3,7 +3,7 @@ let pkg = haskellngPackages.callPackage
             ({ mkDerivation, base, containers, hashable, lens, llvm-general
              , llvm-general-pure, primitive, QuickCheck, stdenv, stm
              , test-framework, test-framework-quickcheck2, transformers
-             , unordered-containers
+             , unordered-containers, criterion
              }:
              mkDerivation {
                pname = "compiled-expressions";
@@ -11,7 +11,7 @@ let pkg = haskellngPackages.callPackage
                src = ./.;
                buildDepends = [
                  base containers hashable lens llvm-general llvm-general-pure
-                 primitive stm transformers unordered-containers
+                 primitive stm transformers unordered-containers criterion
                ];
                testDepends = [
                  base containers QuickCheck test-framework
