@@ -1,11 +1,17 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
+{-# LANGUAGE TypeSynonymInstances #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DeriveTraversable #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE DeriveFoldable #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE CPP #-}
 
 module Data.CompiledExpression.Internal where
 
@@ -27,6 +33,7 @@ import GHC.Generics hiding ( moduleName )
 import qualified Data.HashMap.Strict as HM
 import qualified Data.IntMap.Strict as IM
 import qualified Data.IntSet as IS
+import qualified Data.Map.Strict as M
 import Data.Maybe
 import Foreign.Marshal.Array
 import Foreign.Ptr
@@ -52,33 +59,58 @@ type FloatFun = Ptr CDouble -> Ptr CDouble -> IO ()
 
 foreign import ccall unsafe "dynamic" mkCalling :: FunPtr FloatFun -> FloatFun
 
-data SynthVar
-    = Source !Int
-    | Negate SynthVar
-    | Absolute SynthVar
-    | Signum SynthVar
+debugTrace :: String -> a -> a
+#ifdef SPRINKLE_DEBUG_MESSAGES
+debugTrace str thing = unsafePerformIO $ putStrLn str >> return thing
+#else
+debugTrace _ thing = thing
+#endif
+{-# INLINE debugTrace #-}
+
+debugTraceShow :: Show b => b -> a -> a
+debugTraceShow showable thing = debugTrace (show showable) thing
+{-# INLINE debugTraceShow #-}
+
+-- | Type of deep embedding of expressions.
+--
+-- Note that `Eq` and `Ord` instances for this type don't behave like they
+-- would behave on numbers.
+data SynthVarG a
+    = Source !a
+    | Negate (SynthVarG a)
+    | Absolute (SynthVarG a)
+    | Signum (SynthVarG a)
     | Constant !Double
-    | Plus SynthVar SynthVar
-    | Minus SynthVar SynthVar
-    | Multiply SynthVar SynthVar
-    | Divide SynthVar SynthVar
-    | Exp SynthVar
-    | Log SynthVar
-    | Sqrt SynthVar
-    | Power SynthVar SynthVar
-    | Sin SynthVar
-    | Cos SynthVar
-    | Tan SynthVar
-    | Asin SynthVar
-    | Acos SynthVar
-    | Atan SynthVar
-    | Sinh SynthVar
-    | Cosh SynthVar
-    | Tanh SynthVar
-    | Asinh SynthVar
-    | Acosh SynthVar
-    | Atanh SynthVar
-    deriving ( Show, Data, Generic, Typeable ) -- don't implement Eq or Ord
+    | Plus (SynthVarG a) (SynthVarG a)
+    | Minus (SynthVarG a) (SynthVarG a)
+    | Multiply (SynthVarG a) (SynthVarG a)
+    | Divide (SynthVarG a) (SynthVarG a)
+    | Exp (SynthVarG a)
+    | Log (SynthVarG a)
+    | Sqrt (SynthVarG a)
+    | Power (SynthVarG a) (SynthVarG a)
+    | Sin (SynthVarG a)
+    | Cos (SynthVarG a)
+    | Tan (SynthVarG a)
+    | Asin (SynthVarG a)
+    | Acos (SynthVarG a)
+    | Atan (SynthVarG a)
+    | Sinh (SynthVarG a)
+    | Cosh (SynthVarG a)
+    | Tanh (SynthVarG a)
+    | Asinh (SynthVarG a)
+    | Acosh (SynthVarG a)
+    | Atanh (SynthVarG a)
+    deriving ( Eq, Ord, Show, Data, Generic, Typeable, Functor, Foldable, Traversable )
+
+data CodeGenState = CodeGenState
+    { _visitedNodes :: !IS.IntSet
+    , _outputInstructions :: ![Named LLVM.Instruction] }
+makeLenses ''CodeGenState
+
+type SynthVar = SynthVarG Int
+
+instance Hashable a => Hashable (SynthVarG a)
 
 source :: Int -> SynthVar
 source = Source
@@ -124,15 +156,33 @@ instance Hashable SN where
 data SynthVarBuilder = SynthVarBuilder
     { _nextIndex :: !Int
     , _stableNameMap :: !(HM.HashMap SN Int)
-    , _graph :: !(IM.IntMap SynthVarGraph) }
+    , _duplicateCheckMap :: !(M.Map SynthVar Int)
+    , _graph :: !(IM.IntMap SynthVarGraph)
+#ifdef SPRINKLE_DEBUG_MESSAGES
+    , _numStableNameReductions :: !Int
+    , _numEqualityReductions :: !Int
+#endif
+    }
     deriving ( Typeable, Generic )
 makeLenses ''SynthVarBuilder
+
+areEqualIgnoringInputs :: SynthVar -> SynthVar -> Bool
+areEqualIgnoringInputs svar1 svar2 =
+    let inputless1 = fmap (const ()) svar1
+        inputless2 = fmap (const ()) svar2
+     in inputless1 == inputless2
 
 initialSynthVarBuilder :: SynthVarBuilder
 initialSynthVarBuilder = SynthVarBuilder
     { _nextIndex = 0
     , _stableNameMap = HM.empty
-    , _graph = IM.empty }
+    , _duplicateCheckMap = M.empty
+    , _graph = IM.empty
+#ifdef SPRINKLE_DEBUG_MESSAGES
+    , _numStableNameReductions = 0
+    , _numEqualityReductions = 0
+#endif
+    }
 
 sourcify :: forall a f. Traversable f
          => f a -> f SynthVar
@@ -294,7 +344,10 @@ compileExpression traverse1 traverse2 modifier source = unsafePerformIO $ do
         num_outputs = length listed_outputs
         stumped_output = stump walked
 
-    raw_function <- llvmCode mod
+    raw_function <- debugTrace ("Compiling a function with " <>
+                                show num_outputs <> " outputs and " <>
+                                show len <> " inputs. Graph size " <> show (IM.size graphized)) $
+                    llvmCode mod
 
     return $ \inp -> unsafePerformIO $ do
         let inp_len = lengthOf traverse1 inp
@@ -330,12 +383,18 @@ compileExpression traverse1 traverse2 modifier source = unsafePerformIO $ do
 graphifyStructure :: (forall a b. Traversal (f a) (f b) a b)
                   -> f SynthVar
                   -> IO (f Int, IM.IntMap SynthVarGraph) -- ^ Returns the indices of output variables and the variable graph.
-graphifyStructure traversal1 structure = fmap (over _2 _graph) $
-    flip runStateT initialSynthVarBuilder $ forOf traversal1 structure $ \synth_var -> do
+graphifyStructure traversal1 structure = do
+    (result, svb) <- flip runStateT initialSynthVarBuilder $ forOf traversal1 structure $ \synth_var -> do
         old_svb <- get
         (target_int, new_svb) <- liftIO $ graphify synth_var old_svb
         put new_svb
         return target_int
+    do
+#ifdef SPRINKLE_DEBUG_MESSAGES
+        debugTrace ("Made " <> show (svb^.numStableNameReductions) <> " stable name reductions and " <> show (svb^.numEqualityReductions) <> " equality reductions in this compilation.") $
+#endif
+            return (result, svb^.graph)
+
 {-# INLINE graphifyStructure #-}
 
 llvmfy :: ([Int], IM.IntMap SynthVarGraph) -> LLVM.Module
@@ -400,7 +459,7 @@ llvmfy (outs, graph) = defaultModule { moduleName = "synthvargraph"
     checkBody2 =
         [ Name "check2" := ICmp LLVM.EQ (LocalReference float_ptr_type input_vector_name) (ConstantOperand (C.Null float_ptr_type)) [] ]
 
-    body = reverse (snd (execState (traverse_ bodyBuilder (IM.assocs graph)) (mempty, mempty))) ++ body_output
+    body = reverse (_outputInstructions (execState (traverse_ bodyBuilder (IM.assocs graph)) (CodeGenState IS.empty []))) ++ body_output
 
     body_output = concat $ fmap outBuilder $ zip [(0 :: Int)..] outs
 
@@ -412,12 +471,12 @@ llvmfy (outs, graph) = defaultModule { moduleName = "synthvargraph"
         tmp_name = Name ("outtmp" ++ show key)
 
     bodyBuilder (key, value) = do
-        (visited, _) <- get
+        visited <- use visitedNodes
         if IS.member key visited
           then return ()
-          else do modify (\(a, b) -> (IS.insert key a, b))
+          else do visitedNodes %= IS.insert key
                   result <- instr
-                  modify (\(a, b) -> (a, (reverse result) ++ b))
+                  outputInstructions %= ((reverse result) ++)
       where
         recurse idx =
             let value = fromMaybe (error "invalid index") $ IM.lookup idx graph
@@ -579,15 +638,28 @@ walk sv = do
     idx <- use nextIndex
     nextIndex += 1
     sv' <- liftIO $ evaluate sv
+    -- Try finding a copy by stable name (fast)
     sn <- SN <$> liftIO (makeStableName sv')
     use (stableNameMap.at sn) >>= \case
-        Nothing -> do
-            stableNameMap.at sn .= Just idx
-            graphified <- graphify sv'
-            graphified' <- liftIO $ evaluate graphified
-            graph.at idx .= Just graphified'
         Just old_idx -> do
+#ifdef SPRINKLE_DEBUG_MESSAGES
+            numStableNameReductions += 1
+#endif
             graph.at idx .= Just (GShared old_idx)
+        _ -> do
+            -- Try finding a copy by a Data.Map value (slower)
+            use (duplicateCheckMap.at sv') >>= \case
+                Just old_idx -> do
+#ifdef SPRINKLE_DEBUG_MESSAGES
+                    numEqualityReductions += 1
+#endif
+                    graph.at idx .= Just (GShared old_idx)
+                _ -> do
+                    stableNameMap.at sn .= Just idx
+                    duplicateCheckMap.at sv' .= Just idx
+                    graphified <- graphify sv'
+                    graphified' <- liftIO $ evaluate graphified
+                    graph.at idx .= Just graphified'
     return idx
   where
     graphify (Source s1) =

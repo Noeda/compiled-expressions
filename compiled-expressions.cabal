@@ -29,6 +29,10 @@ build-type:          Simple
 stability:           experimental
 cabal-version:       >=1.10
 
+flag debug-messages
+  description:         Inserts debug trace messages to compilation process. Used for debugging this library.
+  default:             False
+
 library
   exposed-modules:     Data.CompiledExpression
                        Data.CompiledExpression.Internal
@@ -45,6 +49,9 @@ library
                       ,llvm-general-pure    >=3.4.5.3 && <4.0
   hs-source-dirs:      src
   default-language:    Haskell2010
+
+  if flag(debug-messages)
+    cpp-options:       -DSPRINKLE_DEBUG_MESSAGES
 
 test-suite test
   type:                exitcode-stdio-1.0
